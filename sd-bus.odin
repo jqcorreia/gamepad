@@ -16,5 +16,5 @@ foreign import sdbus "system:systemd"
 foreign sdbus {
 	bus_open_system :: proc(_: ^^sd_bus) -> c.int ---
 	bus_unref :: proc(_: ^sd_bus) ---
-	bus_call_method :: proc(bus: ^sd_bus, destination: cstring, path: cstring, interface: cstring, member: cstring, error: ^sd_bus_error, reply: ^^sd_bus_message, types: cstring, args: ..any) -> c.int ---
+	bus_call_method :: proc(bus: ^sd_bus, destination: cstring, path: cstring, interface: cstring, member: cstring, error: ^sd_bus_error, reply: ^^sd_bus_message, types: cstring, #c_vararg args: ..any) -> c.int ---
 }
