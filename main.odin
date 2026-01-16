@@ -139,8 +139,7 @@ test_bit :: proc(bits: []u64, bit: u64) -> bool{
 main :: proc() {
 	// get_gamepad_fd()
     name: [256]u8
-	buf: [size_of(input_event)]u8
-	fd, err := os.open("/dev/input/event26", os.O_RDONLY | os.O_NONBLOCK)
+	fd, err := os.open("/dev/input/event6", os.O_RDONLY | os.O_NONBLOCK)
 
     if err != nil {
         fmt.println(err)
@@ -148,20 +147,34 @@ main :: proc() {
     }
 
     ev_bits: [EV_MAX / (8*size_of(u64)) + 1]u64 = {};
+    key_bits: [KEY_MAX / (8*size_of(u64)) + 1]u64 = {};
 
-    fmt.println("ev bits size", size_of(ev_bits))
+    fmt.println("ev_bits size", size_of(ev_bits))
+    fmt.println("key_bits size", size_of(key_bits))
+
     linux.ioctl(linux.Fd(fd), EVIOCGNAME(size_of(name)), cast(uintptr)&name)
     fmt.println(strings.clone_from(name[:]))
 
-    io_err := linux.ioctl(linux.Fd(fd), EVIOCGBIT(0, size_of(ev_bits)), cast(uintptr)&ev_bits)
+    // This call to EVIOCGBIT uses 0 meaning to get the capabilities of gamepad 
+    // This has to match the ev_bits since its sized to EV_MAX
+    linux.ioctl(linux.Fd(fd), EVIOCGBIT(0, size_of(ev_bits)), cast(uintptr)&ev_bits)
 
     for bit := 0; bit < EV_MAX + 1; bit += 1 {
         fmt.printf("%02X %t\n", bit, test_bit(ev_bits[:], u64(bit)))
     }
 
+    fmt.println("Keys")
+    linux.ioctl(linux.Fd(fd), EVIOCGBIT(EV_KEY, size_of(key_bits)), cast(uintptr)&key_bits)
+
+    for bit := 0; bit < KEY_MAX + 1; bit += 1 {
+        available := test_bit(key_bits[:], u64(bit))
+        if available {
+            fmt.printf("%02X %t\n", bit, available)
+        }
+    }
 
 
-
+	// buf: [size_of(input_event)]u8
 	// for {
         // // time.sleep(200.0  * time.Millisecond)
 	// 	n, read_err := os.read(fd, buf[:])
