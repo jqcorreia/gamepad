@@ -146,7 +146,7 @@ Linux_Axis :: enum u32 {
 
 Linux_Axis_Info :: struct {
 	absinfo: input_absinfo,
-	state:   u32, // originaly a c.uintc
+	state:   i32, // originaly a c.int
 }
 
 js_event :: struct {
@@ -160,7 +160,7 @@ input_event :: struct {
 	time:  linux.Time_Val,
 	type:  u16,
 	code:  u16,
-	value: c.uint,
+	value: c.int,
 }
 
 input_absinfo :: struct {
@@ -175,7 +175,7 @@ input_absinfo :: struct {
 Gamepad :: struct {
 	fd:   os.Handle,
 	name: string,
-	axes: map[u32]Linux_Axis_Info,
+	axes: map[Linux_Axis]Linux_Axis_Info,
 }
 
 
@@ -242,7 +242,7 @@ create_gamepad :: proc(id: u32, device_path: string) -> Gamepad {
 	// Create gamepad
 	gamepad := Gamepad {
 		fd   = fd,
-		name = strings.clone_from(name[:]),
+		name = strings.clone_from_bytes(name[:]),
 	}
 
 	fmt.printf("Detected gamepad %d\n", id)
@@ -250,11 +250,26 @@ create_gamepad :: proc(id: u32, device_path: string) -> Gamepad {
 
 	ev_bits: [EV_MAX / (8 * size_of(u64)) + 1]u64 = {}
 	linux.ioctl(linux.Fd(fd), EVIOCGBIT(0, size_of(ev_bits)), cast(uintptr)&ev_bits)
+	has_abs := test_bit(ev_bits[:], EV_ABS)
 	fmt.printf("\thas_buttons-> '%t'\n", test_bit(ev_bits[:], EV_KEY))
-	fmt.printf("\thas_absolute_movement-> '%t'\n", test_bit(ev_bits[:], EV_ABS))
+	fmt.printf("\thas_absolute_movement-> '%t'\n", has_abs)
 	fmt.printf("\thas_relative_movement-> '%t'\n", test_bit(ev_bits[:], EV_REL))
 
-	// linux.ioctl(linux.Fd(fd), EVIOCGABS(0), cast(uintptr)&gamepad.abs_info)
+	if has_abs {
+		abs_bits: [EV_ABS / (8 * size_of(u64)) + 1]u64 = {}
+		linux.ioctl(linux.Fd(fd), EVIOCGBIT(EV_ABS, size_of(abs_bits)), cast(uintptr)&abs_bits)
+
+		for i in Linux_Axis.X ..< Linux_Axis.TOOL_WIDTH + Linux_Axis(1) {
+			has_axis := test_bit(abs_bits[:], u64(i))
+			if has_axis {
+				axis_info := Linux_Axis_Info{}
+				linux.ioctl(linux.Fd(fd), EVIOCGABS(u32(i)), cast(uintptr)&axis_info.absinfo)
+				gamepad.axes[i] = axis_info
+			}
+		}
+
+	}
+	fmt.println(gamepad)
 
 	return gamepad
 }
@@ -292,7 +307,13 @@ main :: proc() {
 		// https://docs.kernel.org/input/event-codes.html
 		if event.type == EV_SYN || event.type == EV_MSC do continue
 
-		fmt.println(Linux_Button(event.code), Linux_Button_State(event.value))
+		if event.type == EV_KEY {
+			fmt.println(Linux_Button(event.code), Linux_Button_State(event.value))
+		}
+		if event.type == EV_ABS {
+			(&gamepad.axes[Linux_Axis(event.code)]).state = event.value
+			fmt.println(gamepad.axes)
+		}
 		// etype := event.type & ~u8(JS_EVENT_INIT)
 
 		// if etype == JS_EVENT_AXIS {
