@@ -1,37 +1,12 @@
 package main
 
-import "base:runtime"
 import "core:c"
 import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:sys/linux"
-import "core:time"
 
-udev_log_proc :: #type proc "c" (
-	_: ^udev,
-	_: c.int,
-	_: cstring,
-	_: c.int,
-	_: cstring,
-	_: cstring,
-	_args: ..c.int,
-)
-
-logger :: proc "c" (
-	_: ^udev,
-	_: c.int,
-	file: cstring,
-	_: c.int,
-	fn: cstring,
-	format: cstring,
-	_args: ..c.int,
-) {
-	context = runtime.default_context()
-	fmt.println("Udev logging", file, fn, format)
-}
-
-
+// ioctl() related utilities
 _IOC_READ :: 2
 _IOC_NRSHIFT :: 0
 _IOC_TYPESHIFT :: (_IOC_NRSHIFT + _IOC_NRBITS)
@@ -51,23 +26,39 @@ _IOC :: proc(dir: u32, type: u32, nr: u32, size: u32) -> u32 {
 		((size) << _IOC_SIZESHIFT) \
 	)
 }
-
+// This is not working, not sure why size_of(T) is 8 when i pass it input_absinfo
 _IOR :: proc(type: u32, nr: u32, T: typeid) -> u32 {
 	return _IOC(_IOC_READ, (type), (nr), (size_of(T)))
 }
 
+// Evdev related ioctl() calls
+
+// Get device name
 EVIOCGNAME :: proc(len: u32) -> u32 {
 	return _IOC(_IOC_READ, u32('E'), 0x06, len)
 }
 
+// Get list of supported event types if called with ev == 0
+// Get list of supported codes for a give event if ev == event_type
 EVIOCGBIT :: proc(ev: u32, len: u32) -> u32 {
 	return _IOC(_IOC_READ, u32('E'), 0x20 + (ev), len)
 }
 
+// Get Absolute Axes info (maximum, minimum, etc)
 EVIOCGABS :: proc(abs: u32) -> u32 {
-	return _IOR('E', 0x40 + (abs), input_absinfo)
+	return _IOC(_IOC_READ, 'E', 0x40 + (abs), size_of(input_absinfo))
 }
 
+// Helper for bitfield testing
+test_bit :: proc(bits: []u64, bit: u64) -> bool {
+	word_bits: u64 = size_of(u64) * 8
+	idx := bit / word_bits
+	pos := bit % word_bits
+
+	return bits[idx] & (1 << pos) != 0
+}
+
+// Event types
 EV_SYN :: 0x00
 EV_KEY :: 0x01
 EV_REL :: 0x02
@@ -91,6 +82,7 @@ KEY_MAX :: 0x2ff
 BTN_GAMEPAD :: 0x130
 
 // In linux/input.h there are 15 different mapped buttons
+// All of them are from BTN_GAMEPAD up
 Linux_Button :: enum u32 {
 	BTN_0  = BTN_GAMEPAD,
 	BTN_1  = BTN_GAMEPAD + 1,
@@ -109,14 +101,14 @@ Linux_Button :: enum u32 {
 	BTN_15 = BTN_GAMEPAD + 15,
 }
 
+// Evdev EV_KEY events can have these states
 Linux_Button_State :: enum u32 {
 	Released = 0,
 	Pressed  = 1,
 	Repeated = 2,
 }
 
-// Dont use the same base that we use for buttons because
-// they are nice and contiguous
+// Dont use the same base that we use for buttons because they start at 0x00
 Linux_Axis :: enum u32 {
 	X          = 0x00,
 	Y          = 0x01,
@@ -144,18 +136,7 @@ Linux_Axis :: enum u32 {
 	TOOL_WIDTH = 0x1c,
 }
 
-Linux_Axis_Info :: struct {
-	absinfo: input_absinfo,
-	state:   i32, // originaly a c.int
-}
-
-js_event :: struct {
-	time:   u32,
-	value:  i16,
-	type:   u8,
-	number: u8,
-}
-
+// Canonical event when read()'ing from evdev file
 input_event :: struct {
 	time:  linux.Time_Val,
 	type:  u16,
@@ -163,6 +144,7 @@ input_event :: struct {
 	value: c.int,
 }
 
+// Canonical absolute axis information gotten from ioctl() when using EVIOCGABS
 input_absinfo :: struct {
 	value:      i32,
 	minimum:    i32,
@@ -172,55 +154,23 @@ input_absinfo :: struct {
 	resolution: i32,
 }
 
+// Odin structs
+Linux_Axis_Info :: struct {
+	absinfo: input_absinfo,
+	state:   i32, // originaly a c.int
+}
+
 Gamepad :: struct {
 	fd:   os.Handle,
 	name: string,
 	axes: map[Linux_Axis]Linux_Axis_Info,
 }
 
-
-MAX_GAMEPADS :: 4
+MAX_GAMEPADS :: 8
 gamepads: [MAX_GAMEPADS]Gamepad = {}
 
-test_bit :: proc(bits: []u64, bit: u64) -> bool {
-	word_bits: u64 = size_of(u64) * 8
-	idx := bit / word_bits
-	pos := bit % word_bits
-
-	return bits[idx] & (1 << pos) != 0
-
-}
-
-get_potential_gamepad_device_paths :: proc() -> []string {
-	result: [dynamic]string
-	udev := udev_new()
-	// set_log_fn(udev, logger)
-
-	en := enumerate_new(udev)
-	enumerate_add_match_subsystem(en, "input")
-	enumerate_scan_devices(en)
-
-	for entry := enumerate_get_list_entry(en); entry != nil; entry = list_entry_get_next(entry) {
-		syspath := list_entry_get_name(entry)
-		dev := device_new_from_syspath(udev, syspath)
-		node := device_get_devnode(dev)
-
-		if node == nil do continue
-		node_str := strings.clone_from_cstring(node)
-
-		if !strings.starts_with(node_str, "/dev/input/event") do continue // Focus on evdev device files
-
-		prop := device_get_property_value(dev, "ID_INPUT_JOYSTICK")
-		is_joystick := prop != "" ? true : false
-		if is_joystick {
-			append(&result, strings.clone_from_cstring(node))
-		}
-	}
-	return result[:]
-}
-
 check_for_btn_gamepad :: proc(path: string) -> bool {
-	fd, err := os.open("/dev/input/event4", os.O_RDONLY | os.O_NONBLOCK)
+	fd, err := os.open(path, os.O_RDONLY | os.O_NONBLOCK)
 
 	if err != nil {
 		return false
@@ -231,7 +181,28 @@ check_for_btn_gamepad :: proc(path: string) -> bool {
 	return test_bit(key_bits[:], u64(BTN_GAMEPAD))
 }
 
-create_gamepad :: proc(id: u32, device_path: string) -> Gamepad {
+gamepad_init_devices :: proc() {
+	devices_dir := "/dev/input"
+
+	f := os.open(devices_dir) or_else panic("Can't open /dev/input directory")
+
+	fis := os.read_dir(f, -1) or_else panic("Can't list /dev/input directory")
+
+	cur_pad_idx := 0
+	for fi in fis {
+		if strings.starts_with(fi.name, "event") {
+			is_gamepad := check_for_btn_gamepad(fi.fullpath)
+
+			if !is_gamepad {
+				continue
+			}
+			gamepad := gamepad_create(u32(cur_pad_idx), fi.fullpath)
+		}
+	}
+}
+
+
+gamepad_create :: proc(id: u32, device_path: string) -> Gamepad {
 	fd, err := os.open(device_path, os.O_RDONLY | os.O_NONBLOCK)
 	if err != nil {
 		panic(fmt.tprintf("%s", err))
@@ -242,7 +213,7 @@ create_gamepad :: proc(id: u32, device_path: string) -> Gamepad {
 	// Create gamepad
 	gamepad := Gamepad {
 		fd   = fd,
-		name = strings.clone_from_bytes(name[:]),
+		name = strings.clone_from_cstring(cstring(raw_data(name[:]))),
 	}
 
 	fmt.printf("Detected gamepad %d\n", id)
@@ -275,108 +246,46 @@ create_gamepad :: proc(id: u32, device_path: string) -> Gamepad {
 }
 
 main :: proc() {
-	potential_pads := get_potential_gamepad_device_paths()
+	gamepad_init_devices()
+	// potential_pads := get_potential_gamepad_device_paths()
 
-	for pad, idx in potential_pads {
-		is_joystick := check_for_btn_gamepad(pad)
-		if is_joystick {
-			gamepads[idx] = create_gamepad(u32(idx), pad)
-		}
-	}
-
-	gamepad := gamepads[0]
-	buf: [size_of(input_event)]u8
-	for {
-		// time.sleep(200.0  * time.Millisecond)
-		n, read_err := os.read(gamepad.fd, buf[:])
-
-		if read_err != nil {
-			continue
-			// fmt.println(read_err)
-		}
-		if n != size_of(input_event) {
-			continue
-		}
-
-		event := transmute(input_event)buf
-
-		// Ignore "trivial" events for now
-		// SYN is data tranmission control events, SYN_REPORT might be
-		// important to sync composite events like touch gestures in modern gamepads.
-		// MSC is Misc that I don't really know what they mean...
-		// https://docs.kernel.org/input/event-codes.html
-		if event.type == EV_SYN || event.type == EV_MSC do continue
-
-		if event.type == EV_KEY {
-			fmt.println(Linux_Button(event.code), Linux_Button_State(event.value))
-		}
-		if event.type == EV_ABS {
-			(&gamepad.axes[Linux_Axis(event.code)]).state = event.value
-			fmt.println(gamepad.axes)
-		}
-		// etype := event.type & ~u8(JS_EVENT_INIT)
-
-		// if etype == JS_EVENT_AXIS {
-		// fmt.println(event)
-		// 	gamepad.axis_state[event.number] = event.value
-		// }
-	}
-
-	// name: [256]u8
-	// fd, err := os.open("/dev/input/event4", os.O_RDONLY | os.O_NONBLOCK)
-
-	// if err != nil {
-	// 	fmt.println(err)
-	// 	return
-	// }
-
-	// ev_bits: [EV_MAX / (8 * size_of(u64)) + 1]u64 = {}
-	// key_bits: [KEY_MAX / (8 * size_of(u64)) + 1]u64 = {}
-
-	// fmt.println("ev_bits size", size_of(ev_bits))
-	// fmt.println("key_bits size", size_of(key_bits))
-
-	// linux.ioctl(linux.Fd(fd), EVIOCGNAME(size_of(name)), cast(uintptr)&name)
-	// fmt.println(strings.clone_from(name[:]))
-
-	// // This call to EVIOCGBIT uses 0 meaning to get the capabilities of gamepad
-	// // This has to match the ev_bits since its sized to EV_MAX
-	// linux.ioctl(linux.Fd(fd), EVIOCGBIT(0, size_of(ev_bits)), cast(uintptr)&ev_bits)
-
-	// for bit := 0; bit < EV_MAX + 1; bit += 1 {
-	// 	fmt.printf("%02X %t\n", bit, test_bit(ev_bits[:], u64(bit)))
-	// }
-
-	// fmt.println("Keys")
-	// linux.ioctl(linux.Fd(fd), EVIOCGBIT(EV_KEY, size_of(key_bits)), cast(uintptr)&key_bits)
-
-	// for bit := 0; bit < KEY_MAX + 1; bit += 1 {
-	// 	available := test_bit(key_bits[:], u64(bit))
-	// 	if available {
-	// 		fmt.printf("%02X %t\n", bit, available)
+	// for pad, idx in potential_pads {
+	// 	is_joystick := check_for_btn_gamepad(pad)
+	// 	if is_joystick {
+	// 		gamepads[idx] = create_gamepad(u32(idx), pad)
 	// 	}
 	// }
 
-
+	// gamepad := gamepads[0]
 	// buf: [size_of(input_event)]u8
 	// for {
-	// 	// time.sleep(200.0  * time.Millisecond)
-	// 	n, read_err := os.read(fd, buf[:])
+	// 	n, read_err := os.read(gamepad.fd, buf[:])
 
 	// 	if read_err != nil {
 	// 		continue
-	// 		// fmt.println(read_err)
 	// 	}
 	// 	if n != size_of(input_event) {
 	// 		continue
 	// 	}
-	// 	event := transmute(input_event)buf
-	// 	fmt.println(event)
-	// 	// etype := event.type & ~u8(JS_EVENT_INIT)
 
-	// 	// if etype == JS_EVENT_AXIS {
-	// 	// fmt.println(event)
-	// 	// 	gamepad.axis_state[event.number] = event.value
-	// 	// }
+	// 	event := transmute(input_event)buf
+
+	// 	// Ignore "trivial" events for now
+	// 	// SYN is data tranmission control events, SYN_REPORT might be
+	// 	// important to sync composite events like touch gestures in modern gamepads.
+	// 	// MSC is Misc that I don't really know what they mean...
+	// 	// https://docs.kernel.org/input/event-codes.html
+	// 	if event.type == EV_SYN || event.type == EV_MSC do continue
+
+	// 	if event.type == EV_KEY {
+	// 		fmt.println(Linux_Button(event.code), Linux_Button_State(event.value))
+	// 	}
+	// 	if event.type == EV_ABS {
+	// 		(&gamepad.axes[Linux_Axis(event.code)]).state = event.value
+	// 		for axis, state in gamepad.axes {
+	// 			fmt.println(axis, f32(state.state) / f32(state.absinfo.maximum))
+	// 		}
+	// 		fmt.println(gamepad.axes)
+	// 	}
 	// }
 }

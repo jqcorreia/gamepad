@@ -8,6 +8,15 @@ udev_enumerate :: struct {}
 udev_device :: struct {}
 
 dev_t :: c.int
+udev_log_proc :: #type proc "c" (
+	_: ^udev,
+	_: c.int,
+	_: cstring,
+	_: c.int,
+	_: cstring,
+	_: cstring,
+	_args: ..c.int,
+)
 
 foreign import _udev "system:udev"
 
