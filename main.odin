@@ -81,24 +81,27 @@ KEY_MAX :: 0x2ff
 // and also the as the event code
 BTN_GAMEPAD :: 0x130
 
-// In linux/input.h there are 15 different mapped buttons
-// All of them are from BTN_GAMEPAD up
+// In linux/input.h there are 15 different mapped buttons + DPAD that for some reason appear further down....
 Linux_Button :: enum u32 {
-	BTN_0  = BTN_GAMEPAD,
-	BTN_1  = BTN_GAMEPAD + 1,
-	BTN_2  = BTN_GAMEPAD + 2,
-	BTN_3  = BTN_GAMEPAD + 3,
-	BTN_4  = BTN_GAMEPAD + 4,
-	BTN_5  = BTN_GAMEPAD + 5,
-	BTN_6  = BTN_GAMEPAD + 6,
-	BTN_7  = BTN_GAMEPAD + 7,
-	BTN_8  = BTN_GAMEPAD + 8,
-	BTN_9  = BTN_GAMEPAD + 9,
-	BTN_10 = BTN_GAMEPAD + 10,
-	BTN_11 = BTN_GAMEPAD + 11,
-	BTN_13 = BTN_GAMEPAD + 13,
-	BTN_14 = BTN_GAMEPAD + 14,
-	BTN_15 = BTN_GAMEPAD + 15,
+	BTN_A          = BTN_GAMEPAD,
+	BTN_B          = BTN_GAMEPAD + 1,
+	BTN_C          = BTN_GAMEPAD + 2,
+	BTN_X          = BTN_GAMEPAD + 3,
+	BTN_Y          = BTN_GAMEPAD + 4,
+	BTN_Z          = BTN_GAMEPAD + 5,
+	BTN_TL         = BTN_GAMEPAD + 6,
+	BTN_TR         = BTN_GAMEPAD + 7,
+	BTN_TL2        = BTN_GAMEPAD + 8,
+	BTN_TR2        = BTN_GAMEPAD + 9,
+	BTN_SELECT     = BTN_GAMEPAD + 10,
+	BTN_START      = BTN_GAMEPAD + 11,
+	BTN_MODE       = BTN_GAMEPAD + 12,
+	BTN_THUMBL     = BTN_GAMEPAD + 13,
+	BTN_THUMBR     = BTN_GAMEPAD + 14,
+	BTN_DPAD_UP    = 0x220,
+	BTN_DPAD_DOWN  = 0x221,
+	BTN_DPAD_LEFT  = 0x222,
+	BTN_DPAD_RIGHT = 0x223,
 }
 
 // Evdev EV_KEY events can have these states
@@ -135,7 +138,6 @@ Linux_Axis :: enum u32 {
 	TILT_Y     = 0x1b,
 	TOOL_WIDTH = 0x1c,
 }
-
 // Canonical event when read()'ing from evdev file
 input_event :: struct {
 	time:  linux.Time_Val,
