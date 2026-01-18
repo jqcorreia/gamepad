@@ -166,6 +166,21 @@ Gamepad :: struct {
 	axes: map[Linux_Axis]Linux_Axis_Info,
 }
 
+GamepadEvent :: union {
+	ButtonEvent,
+	AxisEvent,
+}
+
+ButtonEvent :: struct {
+	button: Linux_Button,
+	value:  Linux_Button_State,
+}
+
+AxisEvent :: struct {
+	axis:             Linux_Axis,
+	normalized_value: f32,
+}
+
 MAX_GAMEPADS :: 8
 gamepads: [MAX_GAMEPADS]Gamepad = {}
 
@@ -196,13 +211,14 @@ gamepad_init_devices :: proc() {
 			if !is_gamepad {
 				continue
 			}
-			gamepad := gamepad_create(u32(cur_pad_idx), fi.fullpath)
+			gamepad := gamepad_create(fi.fullpath)
+			gamepads[cur_pad_idx] = gamepad
 		}
 	}
 }
 
 
-gamepad_create :: proc(id: u32, device_path: string) -> Gamepad {
+gamepad_create :: proc(device_path: string) -> Gamepad {
 	fd, err := os.open(device_path, os.O_RDONLY | os.O_NONBLOCK)
 	if err != nil {
 		panic(fmt.tprintf("%s", err))
@@ -216,8 +232,8 @@ gamepad_create :: proc(id: u32, device_path: string) -> Gamepad {
 		name = strings.clone_from_cstring(cstring(raw_data(name[:]))),
 	}
 
-	fmt.printf("Detected gamepad %d\n", id)
-	fmt.printf("\tname -> '%s', device_path -> '%s'\n", name, device_path)
+	fmt.printf("Detected gamepad %s\n", name)
+	fmt.printf("\tdevice_path -> '%s'\n", device_path)
 
 	ev_bits: [EV_MAX / (8 * size_of(u64)) + 1]u64 = {}
 	linux.ioctl(linux.Fd(fd), EVIOCGBIT(0, size_of(ev_bits)), cast(uintptr)&ev_bits)
@@ -238,11 +254,52 @@ gamepad_create :: proc(id: u32, device_path: string) -> Gamepad {
 				gamepad.axes[i] = axis_info
 			}
 		}
-
 	}
-	fmt.println(gamepad)
 
 	return gamepad
+}
+gamepad_poll :: proc(gamepad: ^Gamepad) -> []GamepadEvent {
+	res: [dynamic]GamepadEvent
+	buf: [size_of(input_event)]u8
+
+	for {
+		n, read_err := os.read(gamepad.fd, buf[:])
+
+		if read_err != nil {
+			break
+		}
+		if n != size_of(input_event) {
+			break
+		}
+
+		event := transmute(input_event)buf
+
+		// Ignore "trivial" events for now
+		// SYN is data tranmission control events, SYN_REPORT might be
+		// important to sync composite events like touch gestures in modern gamepads.
+		// MSC is Misc that I don't really know what they mean...
+		// https://docs.kernel.org/input/event-codes.html
+		if event.type == EV_SYN || event.type == EV_MSC do continue
+
+		if event.type == EV_KEY {
+			append(
+				&res,
+				ButtonEvent {
+					button = Linux_Button(event.code),
+					value = Linux_Button_State(event.value),
+				},
+			)
+		}
+		if event.type == EV_ABS {
+			(&gamepad.axes[Linux_Axis(event.code)]).state = event.value
+			for axis, state in gamepad.axes {
+				fmt.println(axis, f32(state.state) / f32(state.absinfo.maximum))
+			}
+			fmt.println(gamepad.axes)
+		}
+	}
+
+	return res[:]
 }
 
 main :: proc() {
