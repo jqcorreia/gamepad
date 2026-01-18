@@ -156,8 +156,9 @@ input_absinfo :: struct {
 
 // Odin structs
 Linux_Axis_Info :: struct {
-	absinfo: input_absinfo,
-	state:   i32, // originaly a c.int
+	absinfo:          input_absinfo,
+	value:            f32, // originaly a c.int
+	normalized_value: f32,
 }
 
 Gamepad :: struct {
@@ -181,9 +182,6 @@ AxisEvent :: struct {
 	normalized_value: f32,
 }
 
-MAX_GAMEPADS :: 8
-gamepads: [MAX_GAMEPADS]Gamepad = {}
-
 check_for_btn_gamepad :: proc(path: string) -> bool {
 	fd, err := os.open(path, os.O_RDONLY | os.O_NONBLOCK)
 
@@ -196,14 +194,14 @@ check_for_btn_gamepad :: proc(path: string) -> bool {
 	return test_bit(key_bits[:], u64(BTN_GAMEPAD))
 }
 
-gamepad_init_devices :: proc() {
+gamepad_init_devices :: proc() -> []Gamepad {
+	gamepads: [dynamic]Gamepad
 	devices_dir := "/dev/input"
 
 	f := os.open(devices_dir) or_else panic("Can't open /dev/input directory")
 
 	fis := os.read_dir(f, -1) or_else panic("Can't list /dev/input directory")
 
-	cur_pad_idx := 0
 	for fi in fis {
 		if strings.starts_with(fi.name, "event") {
 			is_gamepad := check_for_btn_gamepad(fi.fullpath)
@@ -212,9 +210,11 @@ gamepad_init_devices :: proc() {
 				continue
 			}
 			gamepad := gamepad_create(fi.fullpath)
-			gamepads[cur_pad_idx] = gamepad
+			append(&gamepads, gamepad)
 		}
 	}
+
+	return gamepads[:]
 }
 
 
@@ -258,6 +258,7 @@ gamepad_create :: proc(device_path: string) -> Gamepad {
 
 	return gamepad
 }
+
 gamepad_poll :: proc(gamepad: ^Gamepad) -> []GamepadEvent {
 	res: [dynamic]GamepadEvent
 	buf: [size_of(input_event)]u8
@@ -291,11 +292,24 @@ gamepad_poll :: proc(gamepad: ^Gamepad) -> []GamepadEvent {
 			)
 		}
 		if event.type == EV_ABS {
-			(&gamepad.axes[Linux_Axis(event.code)]).state = event.value
-			for axis, state in gamepad.axes {
-				fmt.println(axis, f32(state.state) / f32(state.absinfo.maximum))
+			axis := &gamepad.axes[Linux_Axis(event.code)]
+			axis.value = f32(event.value)
+
+			// Kinda wonky way we make sure we are using the correct factor
+			factor: i32 = 0
+			if axis.value < 0 && axis.absinfo.minimum < 0 {
+				factor = -axis.absinfo.minimum
+			} else {
+				factor = axis.absinfo.maximum
 			}
-			fmt.println(gamepad.axes)
+			axis.normalized_value = f32(event.value) / f32(factor)
+			append(
+				&res,
+				AxisEvent{axis = Linux_Axis(event.code), normalized_value = axis.normalized_value},
+			)
+			// for axis, state in gamepad.axes {
+			// 	fmt.println(axis, state)
+			// }
 		}
 	}
 
@@ -303,46 +317,13 @@ gamepad_poll :: proc(gamepad: ^Gamepad) -> []GamepadEvent {
 }
 
 main :: proc() {
-	gamepad_init_devices()
-	// potential_pads := get_potential_gamepad_device_paths()
+	gamepads := gamepad_init_devices()
 
-	// for pad, idx in potential_pads {
-	// 	is_joystick := check_for_btn_gamepad(pad)
-	// 	if is_joystick {
-	// 		gamepads[idx] = create_gamepad(u32(idx), pad)
-	// 	}
-	// }
+	gamepad := gamepads[0]
 
-	// gamepad := gamepads[0]
-	// buf: [size_of(input_event)]u8
-	// for {
-	// 	n, read_err := os.read(gamepad.fd, buf[:])
-
-	// 	if read_err != nil {
-	// 		continue
-	// 	}
-	// 	if n != size_of(input_event) {
-	// 		continue
-	// 	}
-
-	// 	event := transmute(input_event)buf
-
-	// 	// Ignore "trivial" events for now
-	// 	// SYN is data tranmission control events, SYN_REPORT might be
-	// 	// important to sync composite events like touch gestures in modern gamepads.
-	// 	// MSC is Misc that I don't really know what they mean...
-	// 	// https://docs.kernel.org/input/event-codes.html
-	// 	if event.type == EV_SYN || event.type == EV_MSC do continue
-
-	// 	if event.type == EV_KEY {
-	// 		fmt.println(Linux_Button(event.code), Linux_Button_State(event.value))
-	// 	}
-	// 	if event.type == EV_ABS {
-	// 		(&gamepad.axes[Linux_Axis(event.code)]).state = event.value
-	// 		for axis, state in gamepad.axes {
-	// 			fmt.println(axis, f32(state.state) / f32(state.absinfo.maximum))
-	// 		}
-	// 		fmt.println(gamepad.axes)
-	// 	}
-	// }
+	for {
+		for event in gamepad_poll(&gamepad) {
+			fmt.println(event)
+		}
+	}
 }
