@@ -319,13 +319,13 @@ gamepad_poll :: proc(gamepad: ^Gamepad) -> []GamepadEvent {
 }
 
 main :: proc() {
-	gamepads := gamepad_init_devices()
+	// gamepads := gamepad_init_devices()
 
-	gamepad := gamepads[0]
+	// gamepad := gamepads[0]
 
-	for {
-		for event in gamepad_poll(&gamepad) {
-			fmt.println(event)
-		}
-	}
+	// for {
+	// 	for event in gamepad_poll(&gamepad) {
+	// 		fmt.println(event)
+	// 	}
+	// }
 }
