@@ -1,10 +1,35 @@
-package main
+package gamepad
 
 import "core:c"
-import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:sys/linux"
+import "core:sys/posix"
+
+// udev minimal bindings for gamepad connection listening
+udev :: struct {}
+udev_device :: struct {}
+udev_monitor :: struct {}
+
+foreign import udev_lib "system:udev"
+
+@(default_calling_convention = "c", link_prefix = "udev_")
+foreign udev_lib {
+	@(link_prefix = "")
+	udev_new :: proc() -> ^udev ---
+	unref :: proc(udev: ^udev) ---
+
+	device_get_devnode :: proc(dev: ^udev_device) -> cstring ---
+	device_get_action :: proc(dev: ^udev_device) -> cstring ---
+	device_unref :: proc(dev: ^udev_device) ---
+
+	monitor_new_from_netlink :: proc(udev: ^udev, name: cstring) -> ^udev_monitor ---
+	monitor_filter_add_match_subsystem_devtype :: proc(mon: ^udev_monitor, subsystem: cstring, devtype: cstring) -> c.int ---
+	monitor_enable_receiving :: proc(mon: ^udev_monitor) ---
+	monitor_get_fd :: proc(mon: ^udev_monitor) -> c.int ---
+	monitor_receive_device :: proc(mon: ^udev_monitor) -> ^udev_device ---
+	monitor_unref :: proc(mon: ^udev_monitor) ---
+}
 
 // ioctl() related utilities
 _IOC_READ :: 2
@@ -32,7 +57,6 @@ _IOR :: proc(type: u32, nr: u32, T: typeid) -> u32 {
 }
 
 // Evdev related ioctl() calls
-
 // Get device name
 EVIOCGNAME :: proc(len: u32) -> u32 {
 	return _IOC(_IOC_READ, u32('E'), 0x06, len)
@@ -81,7 +105,8 @@ KEY_MAX :: 0x2ff
 // and also the as the event code
 BTN_GAMEPAD :: 0x130
 
-// In linux/input.h there are 15 different mapped buttons + DPAD that for some reason appear further down....
+// In linux/input.h there are 15 different mapped buttons + d-pad 
+// that for some reason appear further down....
 Linux_Button :: enum u32 {
 	BTN_A          = BTN_GAMEPAD,
 	BTN_B          = BTN_GAMEPAD + 1,
@@ -138,6 +163,7 @@ Linux_Axis :: enum u32 {
 	TILT_Y     = 0x1b,
 	TOOL_WIDTH = 0x1c,
 }
+
 // Canonical event when read()'ing from evdev file
 input_event :: struct {
 	time:  linux.Time_Val,
@@ -161,27 +187,69 @@ Linux_Axis_Info :: struct {
 	absinfo:          input_absinfo,
 	value:            f32, // originaly a c.int
 	normalized_value: f32,
+	previous_value:   f32,
 }
 
-Gamepad :: struct {
-	fd:   os.Handle,
-	name: string,
-	axes: map[Linux_Axis]Linux_Axis_Info,
+Linux_Gamepad :: struct {
+	fd:                  os.Handle,
+	active:              bool,
+	name:                string,
+	axes:                map[Linux_Axis]Linux_Axis_Info,
+
+	// This is needed to emit the correct Event_Gamepad_Button_Went_Up events
+	previous_hat_values: map[Linux_Axis]f32,
 }
 
-GamepadEvent :: union {
-	ButtonEvent,
-	AxisEvent,
+Linux_GamepadEvent :: union {
+	Linux_ButtonEvent,
+	Linux_AxisEvent,
 }
 
-ButtonEvent :: struct {
+Linux_ButtonEvent :: struct {
 	button: Linux_Button,
 	value:  Linux_Button_State,
 }
 
-AxisEvent :: struct {
+Linux_AxisEvent :: struct {
 	axis:             Linux_Axis,
 	normalized_value: f32,
+}
+
+Linux_Gamepad_Controller :: struct {
+	gamepads: []Linux_Gamepad,
+	udev:     ^udev,
+	udev_mon: ^udev_monitor,
+	udev_fd:  i32,
+}
+
+gamepad_new_controller :: proc(max_gamepads: int = 4) -> Linux_Gamepad_Controller {
+	// Initialize present devices
+	gamepads := make([]Linux_Gamepad, 4)
+	gps := gamepad_init_devices()
+
+	for i in 0 ..< len(gps) {
+		if i >= max_gamepads {
+			continue
+		}
+		gamepads[i] = gps[i]
+	}
+
+
+	// Initialize udev machinery
+	udev_ptr := udev_new()
+
+	udev_mon_ptr := monitor_new_from_netlink(udev_ptr, "udev")
+
+	monitor_filter_add_match_subsystem_devtype(udev_mon_ptr, "input", nil)
+	monitor_enable_receiving(udev_mon_ptr)
+	udev_fd := monitor_get_fd(udev_mon_ptr)
+
+	return Linux_Gamepad_Controller {
+		gamepads = gamepads,
+		udev = udev_ptr,
+		udev_mon = udev_mon_ptr,
+		udev_fd = udev_fd,
+	}
 }
 
 check_for_btn_gamepad :: proc(path: string) -> bool {
@@ -196,13 +264,19 @@ check_for_btn_gamepad :: proc(path: string) -> bool {
 	return test_bit(key_bits[:], u64(BTN_GAMEPAD))
 }
 
-gamepad_init_devices :: proc() -> []Gamepad {
-	gamepads: [dynamic]Gamepad
+gamepad_init_devices :: proc() -> []Linux_Gamepad {
+	gamepads: [dynamic]Linux_Gamepad
 	devices_dir := "/dev/input"
 
-	f := os.open(devices_dir) or_else panic("Can't open /dev/input directory")
+	f, fok := os.open(devices_dir)
+	if fok != nil {
+		return {}
+	}
 
-	fis := os.read_dir(f, -1) or_else panic("Can't list /dev/input directory")
+	fis, fisok := os.read_dir(f, -1)
+	if fisok != nil {
+		return {}
+	}
 
 	for fi in fis {
 		if strings.starts_with(fi.name, "event") {
@@ -211,39 +285,39 @@ gamepad_init_devices :: proc() -> []Gamepad {
 			if !is_gamepad {
 				continue
 			}
-			gamepad := gamepad_create(fi.fullpath)
+			gamepad, _ := gamepad_create(fi.fullpath)
 			append(&gamepads, gamepad)
 		}
 	}
 
+
 	return gamepads[:]
 }
 
-
-gamepad_create :: proc(device_path: string) -> Gamepad {
+gamepad_create :: proc(device_path: string) -> (Linux_Gamepad, bool) {
 	fd, err := os.open(device_path, os.O_RDONLY | os.O_NONBLOCK)
 	if err != nil {
-		panic(fmt.tprintf("%s", err))
+		return Linux_Gamepad{}, false
 	}
 	name: [256]u8
 	linux.ioctl(linux.Fd(fd), EVIOCGNAME(size_of(name)), cast(uintptr)&name)
 
 	// Create gamepad
-	gamepad := Gamepad {
-		fd   = fd,
-		name = strings.clone_from_cstring(cstring(raw_data(name[:]))),
+	gamepad := Linux_Gamepad {
+		fd     = fd,
+		name   = strings.clone_from_cstring(cstring(raw_data(name[:]))),
+		active = true,
 	}
-
-	fmt.printf("Detected gamepad %s\n", name)
-	fmt.printf("\tdevice_path -> '%s'\n", device_path)
 
 	ev_bits: [EV_MAX / (8 * size_of(u64)) + 1]u64 = {}
 	linux.ioctl(linux.Fd(fd), EVIOCGBIT(0, size_of(ev_bits)), cast(uintptr)&ev_bits)
 	has_abs := test_bit(ev_bits[:], EV_ABS)
-	fmt.printf("\thas_buttons-> '%t'\n", test_bit(ev_bits[:], EV_KEY))
-	fmt.printf("\thas_absolute_movement-> '%t'\n", has_abs)
-	fmt.printf("\thas_relative_movement-> '%t'\n", test_bit(ev_bits[:], EV_REL))
 
+	// fmt.printf("New gamepad %s\n", name)
+	// fmt.printf("\tdevice_path -> '%s'\n", device_path)
+	// fmt.printf("\thas_buttons-> '%t'\n", test_bit(ev_bits[:], EV_KEY))
+	// fmt.printf("\thas_absolute_movement-> '%t'\n", has_abs)
+	// fmt.printf("\thas_relative_movement-> '%t'\n", test_bit(ev_bits[:], EV_REL))
 	if has_abs {
 		abs_bits: [EV_ABS / (8 * size_of(u64)) + 1]u64 = {}
 		linux.ioctl(linux.Fd(fd), EVIOCGBIT(EV_ABS, size_of(abs_bits)), cast(uintptr)&abs_bits)
@@ -258,17 +332,62 @@ gamepad_create :: proc(device_path: string) -> Gamepad {
 		}
 	}
 
-	return gamepad
+	return gamepad, true
 }
 
-gamepad_poll :: proc(gamepad: ^Gamepad) -> []GamepadEvent {
-	res: [dynamic]GamepadEvent
+gamepad_close :: proc(gamepad: ^Linux_Gamepad) {
+	if gamepad.active {
+		os.close(gamepad.fd)
+		gamepad.active = false
+	}
+	// Clean up allocated resources
+	delete(gamepad.name)
+	delete(gamepad.axes)
+	delete(gamepad.previous_hat_values)
+}
+
+
+gamepad_controller_udev_events :: proc(
+	controller: Linux_Gamepad_Controller,
+) -> (
+	Linux_Gamepad,
+	bool,
+) {
+	pfd := posix.pollfd {
+		fd     = posix.FD(controller.udev_fd),
+		events = {posix.Poll_Event_Bits.IN},
+	}
+
+	ret := posix.poll(&pfd, 1, 0)
+	if ret > 0 {
+		dev := monitor_receive_device(controller.udev_mon)
+		path := device_get_devnode(dev)
+		if !check_for_btn_gamepad(strings.clone_from_cstring(path)) {
+			return Linux_Gamepad{}, false
+		}
+		action := device_get_action(dev)
+		if action == "add" {
+			pad, ok := gamepad_create(strings.clone_from_cstring(path))
+			if ok {
+				return pad, true
+			}
+		}
+	}
+
+	return Linux_Gamepad{}, false
+}
+
+gamepad_poll :: proc(gamepad: ^Linux_Gamepad) -> []Linux_GamepadEvent {
+	res: [dynamic]Linux_GamepadEvent
 	buf: [size_of(input_event)]u8
 
 	for {
 		n, read_err := os.read(gamepad.fd, buf[:])
 
-		if read_err != nil {
+		if read_err != nil && read_err != .EAGAIN {
+			// Gamepad disconnected - close the file descriptor
+			os.close(gamepad.fd)
+			gamepad.active = false
 			break
 		}
 		if n != size_of(input_event) {
@@ -287,7 +406,7 @@ gamepad_poll :: proc(gamepad: ^Gamepad) -> []GamepadEvent {
 		if event.type == EV_KEY {
 			append(
 				&res,
-				ButtonEvent {
+				Linux_ButtonEvent {
 					button = Linux_Button(event.code),
 					value = Linux_Button_State(event.value),
 				},
@@ -296,36 +415,18 @@ gamepad_poll :: proc(gamepad: ^Gamepad) -> []GamepadEvent {
 		if event.type == EV_ABS {
 			axis := &gamepad.axes[Linux_Axis(event.code)]
 			axis.value = f32(event.value)
-
-			// Kinda wonky way we make sure we are using the correct factor
-			factor: i32 = 0
-			if axis.value < 0 && axis.absinfo.minimum < 0 {
-				factor = -axis.absinfo.minimum
-			} else {
-				factor = axis.absinfo.maximum
-			}
-			axis.normalized_value = f32(event.value) / f32(factor)
+			min := f32(axis.absinfo.minimum)
+			max := f32(axis.absinfo.maximum)
+			axis.normalized_value = 2.0 * (axis.value - min) / (max - min) - 1.0
 			append(
 				&res,
-				AxisEvent{axis = Linux_Axis(event.code), normalized_value = axis.normalized_value},
+				Linux_AxisEvent {
+					axis = Linux_Axis(event.code),
+					normalized_value = axis.normalized_value,
+				},
 			)
-			// for axis, state in gamepad.axes {
-			// 	fmt.println(axis, state)
-			// }
 		}
 	}
 
 	return res[:]
-}
-
-main :: proc() {
-	// gamepads := gamepad_init_devices()
-
-	// gamepad := gamepads[0]
-
-	// for {
-	// 	for event in gamepad_poll(&gamepad) {
-	// 		fmt.println(event)
-	// 	}
-	// }
 }
