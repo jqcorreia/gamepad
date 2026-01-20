@@ -1,6 +1,7 @@
 package gamepad
 
 import "core:c"
+import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:sys/linux"
@@ -32,6 +33,7 @@ foreign udev_lib {
 }
 
 // ioctl() related utilities
+_IOC_WRITE :: 1
 _IOC_READ :: 2
 _IOC_NRSHIFT :: 0
 _IOC_TYPESHIFT :: (_IOC_NRSHIFT + _IOC_NRBITS)
@@ -56,6 +58,10 @@ _IOR :: proc(type: u32, nr: u32, T: typeid) -> u32 {
 	return _IOC(_IOC_READ, (type), (nr), (size_of(T)))
 }
 
+_IOW :: proc(type: u32, nr: u32, T: typeid) -> u32 {
+	return _IOC(_IOC_READ | _IOC_WRITE, (type), (nr), (size_of(T)))
+}
+
 // Evdev related ioctl() calls
 // Get device name
 EVIOCGNAME :: proc(len: u32) -> u32 {
@@ -72,6 +78,14 @@ EVIOCGBIT :: proc(ev: u32, len: u32) -> u32 {
 EVIOCGABS :: proc(abs: u32) -> u32 {
 	return _IOC(_IOC_READ, 'E', 0x40 + (abs), size_of(input_absinfo))
 }
+
+EVIOCSFF :: proc() -> u32 {
+	return _IOC(_IOC_WRITE, 'E', 0x80, size_of(ff_effect))
+} /* send a force effect to a force feedback device */
+
+EVIOCRMFF :: proc(id: u32) -> u32 {
+	return _IOC(_IOC_WRITE, 'E', 0x80, size_of(c.int))
+} /* Erase a force effect */
 
 // Helper for bitfield testing
 test_bit :: proc(bits: []u64, bit: u64) -> bool {
@@ -99,6 +113,8 @@ EV_MAX :: 0x1f
 EV_CNT :: (EV_MAX + 1)
 
 KEY_MAX :: 0x2ff
+ABS_MAX :: 0x3f
+FF_MAX :: 0x7f
 
 // This is the first and base button
 // This is used as the bit index to check for existence
@@ -164,6 +180,17 @@ Linux_Axis :: enum u32 {
 	TOOL_WIDTH = 0x1c,
 }
 
+Linux_FF_Effects :: enum {
+	FF_RUMBLE   = 0x50,
+	FF_PERIODIC = 0x51,
+	FF_CONSTANT = 0x52,
+	FF_SPRING   = 0x53,
+	FF_FRICTION = 0x54,
+	FF_DAMPER   = 0x55,
+	FF_INERTIA  = 0x56,
+	FF_RAMP     = 0x57,
+}
+
 // Canonical event when read()'ing from evdev file
 input_event :: struct {
 	time:  linux.Time_Val,
@@ -182,6 +209,47 @@ input_absinfo :: struct {
 	resolution: i32,
 }
 
+
+ff_effect :: struct {
+	type:      u16,
+	id:        i16,
+	direction: u16,
+	trigger:   ff_trigger,
+	replay:    ff_replay,
+
+	// We don't need to expose any more effect types for now
+	u:         struct #raw_union {
+		rumble:   ff_rumble_effect,
+		periodic: ff_periodic_effect,
+	},
+}
+
+ff_replay :: struct {
+	length: u16,
+	delay:  u16,
+}
+
+ff_trigger :: struct {
+	button:   u16,
+	interval: u16,
+}
+
+ff_rumble_effect :: struct {
+	strong_magnitude: u16,
+	weak_magnitude:   u16,
+}
+
+ff_periodic_effect :: struct {
+	waveform:    u16,
+	period:      u16,
+	magnitude:   i16,
+	offset:      i16,
+	phase:       u16,
+	envelope:    [2]u16,
+	custom_len:  u32,
+	custom_data: ^i16,
+}
+
 // Odin structs
 Linux_Axis_Info :: struct {
 	absinfo:          input_absinfo,
@@ -198,6 +266,8 @@ Linux_Gamepad :: struct {
 
 	// This is needed to emit the correct Event_Gamepad_Button_Went_Up events
 	previous_hat_values: map[Linux_Axis]f32,
+	has_rumble_support:  bool,
+	rumble_effect_id:    u32,
 }
 
 Linux_GamepadEvent :: union {
@@ -295,7 +365,7 @@ gamepad_init_devices :: proc() -> []Linux_Gamepad {
 }
 
 gamepad_create :: proc(device_path: string) -> (Linux_Gamepad, bool) {
-	fd, err := os.open(device_path, os.O_RDONLY | os.O_NONBLOCK)
+	fd, err := os.open(device_path, os.O_RDWR | os.O_NONBLOCK)
 	if err != nil {
 		return Linux_Gamepad{}, false
 	}
@@ -312,14 +382,16 @@ gamepad_create :: proc(device_path: string) -> (Linux_Gamepad, bool) {
 	ev_bits: [EV_MAX / (8 * size_of(u64)) + 1]u64 = {}
 	linux.ioctl(linux.Fd(fd), EVIOCGBIT(0, size_of(ev_bits)), cast(uintptr)&ev_bits)
 	has_abs := test_bit(ev_bits[:], EV_ABS)
+	has_ff := test_bit(ev_bits[:], EV_FF)
 
-	// fmt.printf("New gamepad %s\n", name)
-	// fmt.printf("\tdevice_path -> '%s'\n", device_path)
-	// fmt.printf("\thas_buttons-> '%t'\n", test_bit(ev_bits[:], EV_KEY))
-	// fmt.printf("\thas_absolute_movement-> '%t'\n", has_abs)
-	// fmt.printf("\thas_relative_movement-> '%t'\n", test_bit(ev_bits[:], EV_REL))
+	fmt.printf("New gamepad %s\n", name)
+	fmt.printf("\tdevice_path -> '%s'\n", device_path)
+	fmt.printf("\thas_buttons-> '%t'\n", test_bit(ev_bits[:], EV_KEY))
+	fmt.printf("\thas_absolute_movement-> '%t'\n", has_abs)
+	fmt.printf("\thas_relative_movement-> '%t'\n", test_bit(ev_bits[:], EV_REL))
+	fmt.printf("\thas_force_feedback-> '%t'\n", test_bit(ev_bits[:], EV_FF))
 	if has_abs {
-		abs_bits: [EV_ABS / (8 * size_of(u64)) + 1]u64 = {}
+		abs_bits: [ABS_MAX / (8 * size_of(u64)) + 1]u64 = {}
 		linux.ioctl(linux.Fd(fd), EVIOCGBIT(EV_ABS, size_of(abs_bits)), cast(uintptr)&abs_bits)
 
 		for i in Linux_Axis.X ..< Linux_Axis.TOOL_WIDTH + Linux_Axis(1) {
@@ -331,8 +403,76 @@ gamepad_create :: proc(device_path: string) -> (Linux_Gamepad, bool) {
 			}
 		}
 	}
+	if has_ff {
+		ff_bits: [FF_MAX / (8 * size_of(u64)) + 1]u64 = {}
+		linux.ioctl(linux.Fd(fd), EVIOCGBIT(EV_FF, size_of(ff_bits)), cast(uintptr)&ff_bits)
+		for i in Linux_FF_Effects.FF_RUMBLE ..< Linux_FF_Effects.FF_RAMP {
+			has_effect := test_bit(ff_bits[:], u64(i))
+			if has_effect && i == Linux_FF_Effects.FF_RUMBLE {
+				fmt.println("config rumble")
+				effect := ff_effect {
+					type = u16(Linux_FF_Effects.FF_RUMBLE),
+					id = -1,
+					direction = 0,
+					trigger = ff_trigger{button = 0, interval = 0},
+					replay = ff_replay{length = 0, delay = 0},
+				}
+
+				effect.u.rumble = ff_rumble_effect {
+					strong_magnitude = 0,
+					weak_magnitude   = 0,
+				}
+
+
+				linux.ioctl(linux.Fd(fd), EVIOCSFF(), cast(uintptr)&effect)
+				fmt.println(effect)
+				gamepad.rumble_effect_id = u32(effect.id)
+			}
+		}
+	}
 
 	return gamepad, true
+}
+
+gamepad_set_rumble :: proc(gp: ^Linux_Gamepad, left: u32, right: u32) {
+	if !gp.has_rumble_support {
+		return
+	}
+
+	fd := gp.fd
+
+	effect := ff_effect {
+		type = u16(Linux_FF_Effects.FF_RUMBLE),
+		id = i16(gp.rumble_effect_id),
+		direction = 0,
+		trigger = ff_trigger{button = 0, interval = 0},
+		replay = ff_replay{length = 0, delay = 0},
+	}
+
+	effect.u.rumble = ff_rumble_effect {
+		strong_magnitude = u16(left),
+		weak_magnitude   = u16(right),
+	}
+
+
+	linux.ioctl(linux.Fd(fd), EVIOCSFF(), cast(uintptr)&effect)
+	event := input_event {
+		type  = EV_FF,
+		code  = u16(gp.rumble_effect_id),
+		value = 1,
+	}
+
+	buf := transmute([size_of(event)]u8)event
+	os.write(fd, buf[:])
+
+	event = input_event {
+		type  = EV_SYN,
+		code  = 0,
+		value = 0,
+	}
+
+	buf = transmute([size_of(event)]u8)event
+	os.write(fd, buf[:])
 }
 
 gamepad_close :: proc(gamepad: ^Linux_Gamepad) {
